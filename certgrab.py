@@ -11,11 +11,14 @@ Author: S8C88 (MIT License 2026)
 
 import argparse
 import hashlib
+import logging
 import socket
 import ssl
 import sys
 
 __version__ = "1.0.0"
+
+logger = logging.getLogger("certgrab")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -38,14 +41,19 @@ def grab_certificate_chain(target: str, port: int = 443,
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
+    # CWE-404: use try/finally to ensure socket is closed on exception
     raw_sock = socket.create_connection((target, port), timeout=timeout)
-    tls_sock = ctx.wrap_socket(raw_sock, server_hostname=target)
-    tls_sock.settimeout(timeout)
-
-    chain = tls_sock.get_peer_cert_chain()
-    result = [parse_ssl_cert(cert) for cert in chain]
-    tls_sock.close()
-    return result
+    try:
+        tls_sock = ctx.wrap_socket(raw_sock, server_hostname=target)
+        tls_sock.settimeout(timeout)
+        chain = tls_sock.get_peer_cert_chain()
+        result = [parse_ssl_cert(cert) for cert in chain]
+        return result
+    finally:
+        try:
+            raw_sock.close()
+        except OSError:
+            pass
 
 
 def parse_ssl_cert(cert) -> dict:
@@ -132,8 +140,9 @@ def check_heartbleed(target: str, port: int = 443,
             result["detail"] = "No heartbeat response (server patched)"
             result["confidence"] = "high"
         raw.close()
-    except Exception as e:
-        result["detail"] = f"Check failed: {e}"
+    except (socket.timeout, OSError, ConnectionError) as e:
+        result["detail"] = "Check failed — connection error"  # CWE-200: user-safe
+        logger.debug("Heartbleed check failed: %s", e)
 
     return result
 
@@ -170,8 +179,9 @@ def check_poodle(target: str, port: int = 443, timeout: float = 10.0) -> dict:
             result["detail"] = "No response to SSLv3 ClientHello (safe)"
             result["confidence"] = "medium"
         raw.close()
-    except Exception as e:
-        result["detail"] = f"Check failed: {e}"
+    except (socket.timeout, OSError, ConnectionError) as e:
+        result["detail"] = "Check failed — connection error"  # CWE-200: user-safe
+        logger.debug("POODLE check failed: %s", e)
 
     return result
 
@@ -203,8 +213,9 @@ def check_insecure_ciphers(target: str, port: int = 443,
                         "bits": bits, "reason": f"Contains {weak}"})
             result["detail"] = (f"Negotiated: {cname} (TLS {ver}, {bits}b)")
         tls.close()
-    except Exception as e:
-        result["detail"] = f"Check failed: {e}"
+    except (socket.timeout, OSError, ssl.SSLError) as e:
+        result["detail"] = "Check failed — connection error"  # CWE-200: user-safe
+        logger.debug("Insecure cipher check failed: %s", e)
 
     return result
 
@@ -301,11 +312,17 @@ def cli():
                         version=f"CertGrab v{__version__}")
     args = parser.parse_args()
 
+    # CWE-20: validate port range
+    if not (1 <= args.port <= 65535):
+        print(f"[-] Invalid port: {args.port}. Must be 1-65535.")
+        sys.exit(1)
+
     print(f"[*] Connecting to {args.target}:{args.port} ...")
     try:
         chain = grab_certificate_chain(args.target, args.port, args.timeout)
-    except Exception as e:
-        print(f"[-] Connection failed: {e}")
+    except (socket.timeout, OSError, ssl.SSLError):
+        print("[-] Connection failed — could not reach target or TLS handshake failed")  # CWE-200: user-safe
+        logger.debug("Connection failed to %s:%d", args.target, args.port)
         sys.exit(1)
 
     print(f"[+] Chain: {len(chain)} certificate(s)\n")
